@@ -1,0 +1,88 @@
+# Multi-platform build - all targets in one container
+FROM ubuntu:24.04 AS base
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    g++ \
+    clang \
+    cmake \
+    git \
+    make \
+    wget \
+    mingw-w64 \
+    libssl-dev \
+    lzma-dev \
+    libxml2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY src/ ./src/
+COPY sdk/ ./sdk/
+COPY docker/Makefile ./Makefile
+
+# ============================================
+# Linux x64 build
+# ============================================
+FROM base AS linux-build
+ENV PLATFORM=Linux
+RUN make && \
+    mkdir -p /output && \
+    cp release/*.so /output/fusion64-linux-x64.so
+
+# ============================================
+# Windows x64 build
+# ============================================
+FROM base AS windows-build
+ENV PLATFORM=Windows
+RUN make && \
+    mkdir -p /output && \
+    cp release/*.dll /output/fusion64-windows-x64.dll
+
+# ============================================
+# macOS osxcross - use pre-built image
+# ============================================
+FROM --platform=$BUILDPLATFORM crazymax/osxcross:latest-ubuntu AS osxcross
+
+# ============================================
+# macOS ARM64 build
+# ============================================
+FROM base AS macos-arm64-build
+ENV PATH="/osxcross/bin:$PATH"
+ENV LD_LIBRARY_PATH="/osxcross/lib"
+ENV PLATFORM=Darwin
+ENV ARCH=arm64
+WORKDIR /build
+COPY src/ ./src/
+COPY sdk/ ./sdk/
+COPY docker/Makefile ./Makefile
+RUN --mount=type=bind,from=osxcross,source=/osxcross,target=/osxcross \
+    make && \
+    mkdir -p /output && \
+    cp release/*.dylib /output/fusion64-macos-arm64.dylib
+
+# ============================================
+# macOS Intel x64 build
+# ============================================
+FROM base AS macos-x64-build
+ENV PATH="/osxcross/bin:$PATH"
+ENV LD_LIBRARY_PATH="/osxcross/lib"
+ENV PLATFORM=Darwin
+ENV ARCH=x86_64
+WORKDIR /build
+COPY src/ ./src/
+COPY sdk/ ./sdk/
+COPY docker/Makefile ./Makefile
+RUN --mount=type=bind,from=osxcross,source=/osxcross,target=/osxcross \
+    make && \
+    mkdir -p /output && \
+    cp release/*.dylib /output/fusion64-macos-x64.dylib
+
+# ============================================
+# Final stage - collect all artifacts
+# ============================================
+FROM alpine:latest AS artifacts
+COPY --from=linux-build /output/fusion64-linux-x64.so /
+COPY --from=windows-build /output/fusion64-windows-x64.dll /
+COPY --from=macos-arm64-build /output/fusion64-macos-arm64.dylib /
+COPY --from=macos-x64-build /output/fusion64-macos-x64.dylib /
+CMD ["/bin/sh"]

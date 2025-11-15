@@ -17,7 +17,7 @@ namespace n_signature{
 
     // Handle the conversion of a code style sig to an IDA one if required
     if(strstr(signature.c_str(), "\\x")){
-      // Fistly, convert \x to a space
+      // Firstly, convert \x to a space
       signature = std::regex_replace(signature, std::regex("\\\\x"), " ");
 
       // Remove any masks before converting 00's to a ?
@@ -50,7 +50,8 @@ namespace n_signature{
 
     while(true){
 #if IDA_SDK_VERSION >= 900
-      addr = bin_search3(addr + 1, ea_max, sig_data, BIN_SEARCH_NOCASE | BIN_SEARCH_FORWARD);
+      // IDA 9.x uses bin_search (bin_search3 was renamed)
+      addr = bin_search(addr + 1, ea_max, sig_data, BIN_SEARCH_NOCASE | BIN_SEARCH_FORWARD);
 #else
       addr = find_binary(addr + 1, ea_max, signature.c_str(), 16, SEARCH_DOWN);
 #endif
@@ -80,7 +81,7 @@ namespace n_signature{
       hide_wait_box();
 
       if(ea.empty())
-        msg("[Fusion] No addresses found from signature\n", addr);
+        msg("[Fusion] No addresses found from signature\n");
       else if(ea.size() > 1)
         msg("[Fusion] Found %i addresses\n", ea.size());
 
@@ -90,12 +91,52 @@ namespace n_signature{
     return ea;
   }
 
+  // Helper function to process instruction and add to signature
+  // Returns: 0 = break, 1 = continue with next_not_tail, 2 = continue without next_not_tail
+  static i32 process_instruction(ea_t addr, c_signature_generator& signature_generator, func_item_iterator_t& iterator, ea_t ea_max, insn_t* out_insn = nullptr){
+    insn_t insn;
+    if(!decode_insn(&insn, addr))
+      return 0;
+
+    // Check if we've reached a function boundary (if enabled)
+    if(n_settings::data & FLAG_RESPECT_FUNCTION_BOUNDARIES){
+      func_t* func = get_func(addr);
+      if(func != nullptr && addr >= func->end_ea)
+        return 0; // Don't go past function end
+    }
+
+    // Get the imm offset for this instruction
+    i32 imm_offset = n_utils::get_insn_imm_offset(&insn);
+
+    // Check if wildcards are enabled
+    bool use_wildcards = !(n_settings::data & FLAG_DISABLE_WILDCARDS);
+
+    // Now add the bytes to the signature generator
+    for(ea_t op_addr = addr; op_addr < (addr + insn.size); op_addr++)
+      signature_generator.add(get_byte(op_addr), use_wildcards && imm_offset > 0 && (op_addr - addr) >= imm_offset);
+
+    // Return instruction if requested
+    if(out_insn != nullptr)
+      *out_insn = insn;
+
+    // These instructions are not parsed correctly by ida, so lets fix it
+    if(get_byte(addr) == 0xCC || get_byte(addr) == 0x90){
+      iterator.set_range(addr + 1, ea_max);
+      return 2; // Continue but skip next_not_tail
+    }
+
+    return iterator.next_not_tail() ? 1 : 0;
+  }
+
   static void create(e_signature_style style){
     if(!(n_settings::data & FLAG_ALLOW_SIG_CREATION_IN_DR) && get_func_num(get_screen_ea()) == 0xFFFFFFFF){
       hide_wait_box();
       warning("[Fusion] `0x%llX` Is not in a valid assembly region.\n\nHint: You can disable this in the settings of Fusion.", get_screen_ea());
       return;
     }
+
+    // Start timing
+    auto start_time = std::chrono::high_resolution_clock::now();
 
     c_signature_generator signature_generator;
     ea_t                  ea_region_start = 0;
@@ -112,24 +153,7 @@ namespace n_signature{
       func_item_iterator_t iterator;
       iterator.set_range(ea_region_start, ea_region_end);
       for(ea_t addr = iterator.current(); true; addr = iterator.current()){
-        insn_t insn;
-        if(!decode_insn(&insn, addr))
-          break;
-
-        // Get the imm offset for this instruction
-        i32 imm_offset = n_utils::get_insn_imm_offset(&insn);
-
-        // Now add the bytes to the signature generator
-        for(ea_t op_addr = addr; op_addr < (addr + insn.size); op_addr++)
-          signature_generator.add(get_byte(op_addr), imm_offset > 0 && (op_addr - addr) >= imm_offset);
-
-        // These instructions are not parsed correctly by ida, so lets fix it
-        if(get_byte(addr) == 0xCC || get_byte(addr) == 0x90){
-          iterator.set_range(addr + 1, ea_max);
-          continue;
-        }
-
-        if(!iterator.next_not_tail())
+        if(process_instruction(addr, signature_generator, iterator, ea_max) == 0)
           break;
       }
     }
@@ -138,7 +162,7 @@ namespace n_signature{
       ea_t last_found_address = ea_min;
 
       // Generate memory for the mnemonic opcodes list
-      u32 mnemonic_opcodes_len  = 5000/*5KB*/;
+      u32 mnemonic_opcodes_len  = 5000/*~4.9KB*/;
       i8* mnemonic_opcodes      = (n_settings::data & FLAG_SHOW_MNEMONIC_OPCODES_SIGGED) ? (i8*)malloc(mnemonic_opcodes_len) : nullptr;
 
       if(mnemonic_opcodes != nullptr)
@@ -148,15 +172,9 @@ namespace n_signature{
       iterator.set_range(target_addr, ea_max);
       for(ea_t addr = iterator.current(); true; addr = iterator.current()){
         insn_t insn;
-        if(!decode_insn(&insn, addr))
+        i32 result = process_instruction(addr, signature_generator, iterator, ea_max, &insn);
+        if(result == 0)
           break;
-
-        // Get the imm offset for this instruction
-        i32 imm_offset = n_utils::get_insn_imm_offset(&insn);
-
-        // Now add the bytes to the signature generator
-        for(ea_t op_addr = addr; op_addr < (addr + insn.size); op_addr++)
-          signature_generator.add(get_byte(op_addr), imm_offset > 0 && (op_addr - addr) >= imm_offset);
 
         // Add details on whats going on in relation to this creation
         if(n_settings::data & FLAG_SHOW_MNEMONIC_OPCODES_SIGGED){
@@ -181,14 +199,9 @@ namespace n_signature{
           last_found_address = search_result[0];
         }
 
-        // These instructions are not parsed correctly by ida, so lets fix it
-        if(get_byte(addr) == 0xCC || get_byte(addr) == 0x90){
-          iterator.set_range(addr + 1, ea_max);
+        // If result is 2, we already handled iterator advance
+        if(result == 2)
           continue;
-        }
-
-        if(!iterator.next_not_tail())
-          break;
       }
 
       if(mnemonic_opcodes != nullptr)
@@ -208,12 +221,29 @@ namespace n_signature{
         return;
       }
 
-      // Display
-      msg("[Fusion] %s\n", signature);
+      // Calculate elapsed time
+      auto end_time = std::chrono::high_resolution_clock::now();
+      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+      double seconds = duration.count() / 1000.0;
 
-      // Copy to clipboard
+      // Auto-validate: Check signature uniqueness
+      std::vector<ea_t> validation_results = find(signature, {true, false, 0, 0, false});
+      size_t match_count = validation_results.size();
+
+      // Create signature with timing info and match count
+      i8 buffer[8192 + 50];
+      if(match_count == 1)
+        qsnprintf(buffer, sizeof(buffer), "%s (%.3fs | unique)", signature, seconds);
+      else if(match_count == 0)
+        qsnprintf(buffer, sizeof(buffer), "%s (%.3fs | NO MATCHES)", signature, seconds);
+      else
+        qsnprintf(buffer, sizeof(buffer), "%s (%.3fs | %zu matches)", signature, seconds, match_count);
+
+      // Copy to clipboard (this will also print the signature on macOS/Linux)
       if(n_settings::data & FLAG_COPY_CREATED_SIGNATURES_TO_CB)
-        n_utils::copy_to_clipboard(signature);
+        n_utils::copy_to_clipboard(buffer);
+      else
+        msg("[Fusion] %s\n", buffer); // Only print if not copying to clipboard
 
       // Now free the rendered signature
       free(signature);

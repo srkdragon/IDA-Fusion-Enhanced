@@ -53,7 +53,7 @@ public:
         return 8;
       default:
         error("[Fusion] get_sig_len_per_byte failed with %i\n", style);
-        return -1;
+        return 0;  // Return 0 instead of -1 for u32
     }
   }
 
@@ -69,6 +69,10 @@ public:
 
     // Allocate room for the signature
     i8* sig = (i8*)malloc(sig_len);
+    if(sig == nullptr){
+      error("[Fusion] Memory allocation failed for signature\n");
+      return nullptr;
+    }
     memset(sig, 0, sig_len);
 
     if (style == SIGNATURE_STYLE_FNV1A)

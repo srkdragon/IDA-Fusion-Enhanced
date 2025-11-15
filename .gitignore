@@ -1,3 +1,32 @@
-*.dll
-*.zip
-sdk
+# Object files directory
+obj/
+
+# IDA SDK (not included in repo)
+sdk/
+
+# Temporary files
+*.tmp
+*.temp
+*~
+.DS_Store
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+
+# macOS specific
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Windows specific
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Build directories
+release/
