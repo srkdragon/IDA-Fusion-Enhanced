@@ -28,9 +28,11 @@ Signature scanner and creator for **IDA Pro 7/8/9+** with support for **Windows*
 
 - Context menu integration (right-click → Fusion)
 - Platform-specific hotkeys (⌘⌥S / Ctrl+Alt+S)
+- Cross-platform clipboard support (Windows API, macOS pbcopy, Linux xclip)
 - Function boundary detection
 - Wildcard toggle for immediate values
 - Memory safety & code quality improvements
+- User directory settings (no admin rights required)
 
 ---
 
@@ -55,7 +57,8 @@ This makes signatures resilient against anti-reversing techniques. Wildcard beha
 **2. Copy** to IDA plugins folder:
 
 - ▪ Windows: `fusion64-windows-x64.dll` → `C:\Program Files\IDA Pro X.X\plugins\`
-- ▪ Linux: `fusion64-linux-x64.so` → `/path/to/ida/plugins/`
+- ▪ Linux x64: `fusion64-linux-x64.so` → `/path/to/ida/plugins/`
+- ▪ Linux ARM64: `fusion64-linux-arm64.so` → `/path/to/ida/plugins/`
 - ▪ macOS: `fusion64-macos-*.dylib` → `/Applications/IDA Pro X.X.app/Contents/MacOS/plugins/`
 
 **3. Restart** IDA Pro
@@ -82,10 +85,19 @@ This makes signatures resilient against anti-reversing techniques. Wildcard beha
 ### Build All Platforms
 
 ```bash
-make build
+make build       # Docker: Linux x64/ARM64, macOS x64/ARM64 (4 platforms)
+make build-all   # All 5 platforms including Windows x64 (requires xwin)
 ```
 
-Builds **all 4 platforms** (Linux x64, Windows x64, macOS ARM64, macOS Intel x64) in a single Docker multi-stage container.
+**Docker Build** (Linux + macOS):
+
+- Builds **4 platforms** in a single Docker multi-stage container
+- No additional dependencies required
+
+**Windows Cross-Compilation** (macOS/Linux → Windows):
+
+- Requires [xwin](https://github.com/Jake-Shadle/xwin) and LLVM
+- Builds Windows x64 DLL using Clang with MSVC ABI
 
 **Output:** `release/fusion64-{platform}-{arch}.{ext}`
 
