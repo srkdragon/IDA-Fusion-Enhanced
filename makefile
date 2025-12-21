@@ -124,7 +124,7 @@ else
 	@printf "[+] Windows x64: release/fusion64-windows-x64.dll\n"
 endif
 
-build-all: clean build build-windows
+build-all: build build-windows
 	@printf "\n[*] ========================================\n"
 	@printf "[+] ALL PLATFORMS BUILT SUCCESSFULLY!\n"
 	@printf "\n"
