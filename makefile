@@ -42,7 +42,7 @@ check-docker:
 		fi \
 	)
 
-build: check-docker
+build: clean check-docker
 	@printf "[*] Building all platforms via Docker multi-stage build...\n"
 	@docker build -f docker/Dockerfile --target artifacts -t fusion-all-artifacts .
 	@printf "[*] Extracting binaries...\n"
