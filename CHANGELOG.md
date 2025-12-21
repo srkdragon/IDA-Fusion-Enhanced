@@ -4,6 +4,44 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [2.0.1] - 2025-12-21
+
+### Added
+
+**Platform Support**
+- ► Linux ARM64 (full support)
+- ► Windows x64 cross-compilation (xwin + clang-cl)
+
+**Features**
+- Cross-platform clipboard support
+  - Windows: Native API (GlobalAlloc/SetClipboardData)
+  - macOS: pbcopy integration
+  - Linux: xclip integration
+- Complete Docker multi-stage build system
+  - Builds all 5 platforms in single command
+  - Optimized layer caching
+  - Automated binary extraction
+
+### Fixed
+
+**Critical**
+- Windows crashes during signature generation (format string vulnerabilities)
+- Windows settings write permission errors (moved to user directory)
+- Windows console output missing (now always prints with timing/match info)
+
+**Quality**
+- Format string type safety (`%llX` → `%p` for pointers, `%i` → `%zu` for size_t)
+- Clipboard gets clean signature, console gets full diagnostic info
+- User directory settings path for cross-platform compatibility
+
+### Changed
+
+- Build system unified with Docker multi-platform support
+- Settings location: `%APPDATA%\Hex-Rays\IDA Pro` (Windows) / `~/.idapro` (Unix)
+- Console output format: signature + timing + match count
+
+---
+
 ## [2.0.0] - 2025-11-15
 
 ### Added

@@ -1,5 +1,5 @@
 # Multi-platform build - all targets in one container
-FROM ubuntu:24.04 AS base
+FROM --platform=linux/amd64 ubuntu:24.04 AS base
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -9,7 +9,6 @@ RUN apt-get update && apt-get install -y \
     git \
     make \
     wget \
-    mingw-w64 \
     libssl-dev \
     lzma-dev \
     libxml2-dev \
@@ -30,18 +29,30 @@ RUN make && \
     cp release/*.so /output/fusion64-linux-x64.so
 
 # ============================================
-# Windows x64 build
+# Linux ARM64 build
 # ============================================
-FROM base AS windows-build
-ENV PLATFORM=Windows
+FROM --platform=linux/arm64 ubuntu:24.04 AS linux-arm64-build
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    g++ \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY src/ ./src/
+COPY sdk/ ./sdk/
+COPY docker/Makefile ./Makefile
+
+ENV PLATFORM=Linux
 RUN make && \
     mkdir -p /output && \
-    cp release/*.dll /output/fusion64-windows-x64.dll
+    cp release/*.so /output/fusion64-linux-arm64.so
 
 # ============================================
 # macOS osxcross - use pre-built image
 # ============================================
-FROM --platform=$BUILDPLATFORM crazymax/osxcross:latest-ubuntu AS osxcross
+FROM --platform=linux/amd64 crazymax/osxcross:latest-ubuntu AS osxcross
 
 # ============================================
 # macOS ARM64 build
@@ -82,7 +93,7 @@ RUN --mount=type=bind,from=osxcross,source=/osxcross,target=/osxcross \
 # ============================================
 FROM alpine:latest AS artifacts
 COPY --from=linux-build /output/fusion64-linux-x64.so /
-COPY --from=windows-build /output/fusion64-windows-x64.dll /
+COPY --from=linux-arm64-build /output/fusion64-linux-arm64.so /
 COPY --from=macos-arm64-build /output/fusion64-macos-arm64.dylib /
 COPY --from=macos-x64-build /output/fusion64-macos-x64.dylib /
 CMD ["/bin/sh"]

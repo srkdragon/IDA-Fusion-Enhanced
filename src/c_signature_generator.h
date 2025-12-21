@@ -82,7 +82,7 @@ public:
     else{
       for(u32 i = 0; i < bytes.size(); i++){
         if((strlen(sig) + sig_len_per_byte) > sig_len){
-          warning("[Fusion] `0x%llX` Has a bugged signature buffer (0)", sig);
+          warning("[Fusion] `%p` Has a bugged signature buffer (0)", (void*)sig);
           break;
         }
 
@@ -103,7 +103,7 @@ public:
 
         for(u32 i = 0; i < bytes.size(); i++){
           if((strlen(sig) + sig_len_per_byte) > sig_len){
-            warning("[Fusion] `0x%llX` Has a bugged signature buffer (1)", sig);
+            warning("[Fusion] `%p` Has a bugged signature buffer (1)", (void*)sig);
             break;
           }
 

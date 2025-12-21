@@ -24,12 +24,12 @@ EXTERN bool idaapi plugin_run(size_t arg);
 namespace n_settings{
   u32 data = FLAG_AUTO_JUMP_TO_FOUND_SIGNATURES | FLAG_COPY_SELECTED_BYTES_ONLY_IN_RANGE | FLAG_SHOW_MNEMONIC_OPCODES_SIGGED | FLAG_COPY_CREATED_SIGNATURES_TO_CB | FLAG_RESPECT_FUNCTION_BOUNDARIES;
 
-  // Get settings file path in plugins directory
+  // Get settings file path in user directory (writable on all platforms)
   static std::string get_settings_path(){
-    const char* plugins_dir = idadir(PLG_SUBDIR);
-    if(plugins_dir && *plugins_dir){
+    const char* user_dir = get_user_idadir();
+    if(user_dir && *user_dir){
       char path[QMAXPATH];
-      qsnprintf(path, sizeof(path), "%s/fusion_settings.cfg", plugins_dir);
+      qsnprintf(path, sizeof(path), "%s/fusion_settings.cfg", user_dir);
       return std::string(path);
     }
     return "";

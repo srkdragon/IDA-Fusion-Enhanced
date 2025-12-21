@@ -69,8 +69,8 @@ namespace n_signature{
       ea.push_back(addr);
 
       if(!find_settings.silent){
-        replace_wait_box("[Fusion] Searching...\n\nFound %i signature%s", ea.size(), ea.size() > 1 ? "s" : "");
-        msg("[Fusion] %i. Found at address `0x%llX`\n", ea.size(), addr);
+        replace_wait_box("[Fusion] Searching...\n\nFound %zu signature%s", ea.size(), ea.size() > 1 ? "s" : "");
+        msg("[Fusion] %zu. Found at address `0x%llX`\n", ea.size(), addr);
       }
 
       if(find_settings.stop_at_first)
@@ -83,7 +83,7 @@ namespace n_signature{
       if(ea.empty())
         msg("[Fusion] No addresses found from signature\n");
       else if(ea.size() > 1)
-        msg("[Fusion] Found %i addresses\n", ea.size());
+        msg("[Fusion] Found %zu addresses\n", ea.size());
 
       beep(beep_default);
     }
@@ -146,7 +146,7 @@ namespace n_signature{
     n_utils::get_text_min_max(ea_min, ea_max);
 
     // Display a status that we are creating a signature for our screen ea
-    replace_wait_box("[Fusion] Creating signature for `0x%llX`");
+    replace_wait_box("[Fusion] Creating signature for `0x%llX`", get_screen_ea());
 
     // If we have selected a range of assembly code, then specifically sig that code only
     if((n_settings::data & FLAG_COPY_SELECTED_BYTES_ONLY_IN_RANGE) && read_range_selection(nullptr, &ea_region_start, &ea_region_end)){
@@ -230,7 +230,7 @@ namespace n_signature{
       std::vector<ea_t> validation_results = find(signature, {true, false, 0, 0, false});
       size_t match_count = validation_results.size();
 
-      // Create signature with timing info and match count
+      // Create signature with timing info and match count for console display
       i8 buffer[8192 + 50];
       if(match_count == 1)
         qsnprintf(buffer, sizeof(buffer), "%s (%.3fs | unique)", signature, seconds);
@@ -239,11 +239,11 @@ namespace n_signature{
       else
         qsnprintf(buffer, sizeof(buffer), "%s (%.3fs | %zu matches)", signature, seconds, match_count);
 
-      // Copy to clipboard (this will also print the signature on macOS/Linux)
+      // Copy ONLY signature to clipboard (without timing/matches), and always print to console
       if(n_settings::data & FLAG_COPY_CREATED_SIGNATURES_TO_CB)
-        n_utils::copy_to_clipboard(buffer);
-      else
-        msg("[Fusion] %s\n", buffer); // Only print if not copying to clipboard
+        n_utils::copy_to_clipboard(signature);
+
+      msg("[Fusion] %s\n", buffer); // Always print full info to console
 
       // Now free the rendered signature
       free(signature);

@@ -24,6 +24,7 @@ namespace n_utils{
 
   inline void copy_to_clipboard(i8* buffer){
 #ifdef __NT__
+    // Windows clipboard
     u32   alloc_len = strlen(buffer) + 1;
     void* alloc     = GlobalAlloc(GMEM_FIXED, alloc_len);
     if(alloc == nullptr){
@@ -37,9 +38,22 @@ namespace n_utils{
     EmptyClipboard();
     SetClipboardData(CF_TEXT, alloc);
     CloseClipboard();
-#else
-    // macOS/Linux: Print to console (clipboard not implemented)
-    msg("[Fusion] Signature: %s\n", buffer);
+#elif defined(__MAC__)
+    // macOS clipboard using pbcopy
+    #undef fprintf
+    FILE* pipe = popen("pbcopy", "w");
+    if(pipe){
+      fprintf(pipe, "%s", buffer);
+      pclose(pipe);
+    }
+#elif defined(__LINUX__)
+    // Linux clipboard using xclip (if available)
+    #undef fprintf
+    FILE* pipe = popen("xclip -selection clipboard 2>/dev/null", "w");
+    if(pipe){
+      fprintf(pipe, "%s", buffer);
+      pclose(pipe);
+    }
 #endif
   }
 

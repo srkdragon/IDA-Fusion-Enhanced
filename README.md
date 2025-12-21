@@ -21,6 +21,7 @@ Signature scanner and creator for **IDA Pro 7/8/9+** with support for **Windows*
 - ► macOS ARM64 (Apple Silicon)
 - ► macOS x64 (Intel)
 - ► Linux x64
+- ► Linux ARM64
 - ► Windows x64
 
 **Enhancements**
