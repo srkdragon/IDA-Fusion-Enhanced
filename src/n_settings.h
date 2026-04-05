@@ -66,7 +66,7 @@ namespace n_settings{
 
   bool show_settings_dialog(){
     bool form_ok = ask_form(
-      "Fusion — Settings\n"
+      "Fusion - Settings\n"
       "<#Auto jump to found signatures:C>\n"
       "<#Explicitly copy selected bytes only when in a range:C>\n"
       "<#Show mnemonic opcodes when creating signatures:C>\n"
