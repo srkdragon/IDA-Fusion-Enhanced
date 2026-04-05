@@ -4,6 +4,28 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [2.1.0] - 2026-04-05
+
+### Added
+
+- XREF signature generation — finds all code XREFs to the target function and generates a unique signature at each call site
+- Multi-threaded XREF processing — executable segments are snapshotted into RAM, then all call sites are searched in parallel (one thread per CPU core); no IDA API usage in worker threads
+- Vtable hint when no code XREFs are found — shows the data XREF count and explains the function is likely called through virtual dispatch
+- User cancellation support during XREF pre-decode phase
+
+### Changed
+
+- XREF results are sorted by signature length (shortest first), shortest is copied to clipboard automatically
+- Plugin hooks modernized: replaced deprecated `hook_to_notification_point` with `hook_event_listener` / `DECLARE_LISTENER` (IDA 9.x API)
+- "Search for signature" menu option removed — redundant with IDA's built-in search
+
+### Fixed
+
+- Selected byte range signatures no longer get trimmed — wildcards at the edges are preserved when the user explicitly selected the range
+- Docker build no longer hardcodes `--platform=linux/amd64`, uses `ARG BUILDPLATFORM` instead
+
+---
+
 ## [2.0.1] - 2025-12-21
 
 ### Added
