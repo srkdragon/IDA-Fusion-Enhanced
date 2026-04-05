@@ -299,6 +299,9 @@ namespace n_signature{
     auto overall_start = std::chrono::high_resolution_clock::now();
 
     for (size_t i = 0; i < call_sites.size(); i++) {
+      if (user_cancelled())
+        break;
+
       ea_t caller_ea = call_sites[i];
       replace_wait_box("[Fusion] XREF %zu/%zu (0x%llX)...", i + 1, call_sites.size(), caller_ea);
 
