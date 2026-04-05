@@ -1,5 +1,6 @@
 # Multi-platform build - all targets in one container
-FROM --platform=linux/amd64 ubuntu:24.04 AS base
+ARG BUILDPLATFORM=linux/amd64
+FROM --platform=${BUILDPLATFORM} ubuntu:24.04 AS base
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -52,7 +53,7 @@ RUN make && \
 # ============================================
 # macOS osxcross - use pre-built image
 # ============================================
-FROM --platform=linux/amd64 crazymax/osxcross:latest-ubuntu AS osxcross
+FROM --platform=${BUILDPLATFORM} crazymax/osxcross:latest-ubuntu AS osxcross
 
 # ============================================
 # macOS ARM64 build
