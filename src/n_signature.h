@@ -148,8 +148,11 @@ namespace n_signature{
     // Display a status that we are creating a signature for our screen ea
     replace_wait_box("[Fusion] Creating signature for `0x%llX`", get_screen_ea());
 
-    // If we have selected a range of assembly code, then specifically sig that code only
-    if((n_settings::data & FLAG_COPY_SELECTED_BYTES_ONLY_IN_RANGE) && read_range_selection(nullptr, &ea_region_start, &ea_region_end)){
+    // If we have selected a range of assembly code, sig exactly those bytes (no trim — user chose them)
+    bool selected_range = (n_settings::data & FLAG_COPY_SELECTED_BYTES_ONLY_IN_RANGE)
+                          && read_range_selection(nullptr, &ea_region_start, &ea_region_end)
+                          && ea_region_end > ea_region_start;
+    if(selected_range){
       func_item_iterator_t iterator;
       iterator.set_range(ea_region_start, ea_region_end);
       for(ea_t addr = iterator.current(); true; addr = iterator.current()){
@@ -210,8 +213,9 @@ namespace n_signature{
 
     // Do we have a signature to build?
     if(signature_generator.has_bytes){
-      // Trim the signature
-      signature_generator.trim();
+      // Don't trim selected-range sigs — user explicitly chose those bytes
+      if(!selected_range)
+        signature_generator.trim();
 
       // Create a render of the signature in the selected style
       i8* signature = signature_generator.render(style);
@@ -310,6 +314,12 @@ namespace n_signature{
         i32 result = process_instruction(addr, sig_gen, iterator, ea_max);
         if (result == 0)
           break;
+
+        // Skip search until we have enough bytes (first call instr is always E8 ?? ?? ?? ??)
+        // and bail out if the sig grows too large without becoming unique (random optimization)
+        size_t byte_count = sig_gen.bytes.size();
+        if (byte_count < 8) { if (result == 2) continue; continue; }
+        if (byte_count > 100) break;
 
         i8* ida_sig = sig_gen.render(SIGNATURE_STYLE_IDA);
         if (ida_sig == nullptr)
