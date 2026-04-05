@@ -22,6 +22,9 @@
 #include <kernwin.hpp>
 #include <diskio.hpp>
 #include <xref.hpp>
+#include <segment.hpp>
+#include <thread>
+#include <mutex>
 
 // Custom
 #include "n_utils.h"

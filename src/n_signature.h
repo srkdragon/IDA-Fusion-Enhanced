@@ -256,17 +256,157 @@ namespace n_signature{
     }
   }
 
+  struct mem_section_t {
+    ea_t           start_ea;
+    std::vector<u8> bytes;
+  };
+
+  // snapshot all executable segments into plain memory so threads can search without IDA API
+  static std::vector<mem_section_t> load_memory_image() {
+    std::vector<mem_section_t> sections;
+    int count = get_segm_qty();
+    for (int i = 0; i < count; i++) {
+      segment_t* seg = getnseg(i);
+      if (seg == nullptr || !(seg->perm & SEGPERM_EXEC)) continue;
+      mem_section_t sec;
+      sec.start_ea = seg->start_ea;
+      size_t len = (size_t)(seg->end_ea - seg->start_ea);
+      sec.bytes.resize(len, 0);
+      get_bytes(sec.bytes.data(), len, seg->start_ea);
+      sections.push_back(std::move(sec));
+    }
+    return sections;
+  }
+
+  // brute-force scan the memory snapshot — safe to call from any thread
+  static ea_t mem_find(const std::vector<mem_section_t>& mem,
+                       const std::vector<u8>& sig_bytes,
+                       const std::vector<bool>& sig_imm,
+                       ea_t start_at, ea_t ignore_ea) {
+    size_t sig_len = sig_bytes.size();
+
+    for (const auto& sec : mem) {
+      size_t sec_len = sec.bytes.size();
+      if (sec_len < sig_len)            continue;
+      if (start_at >= sec.start_ea + sec_len) continue;
+
+      size_t     start_off = (start_at > sec.start_ea) ? (size_t)(start_at - sec.start_ea) : 0;
+      const u8*  data      = sec.bytes.data();
+
+      for (size_t i = start_off; i + sig_len <= sec_len; i++) {
+        if (sec.start_ea + i == ignore_ea) continue;
+
+        bool match = true;
+        for (size_t j = 0; j < sig_len; j++) {
+          if (!sig_imm[j] && data[i + j] != sig_bytes[j]) {
+            match = false;
+            break;
+          }
+        }
+
+        if (match) return sec.start_ea + i;
+      }
+    }
+
+    return BADADDR;
+  }
+
+  struct pre_insn_t {
+    u32            size;
+    i32            imm_offset;
+    std::vector<u8> raw;
+  };
+
+  // decode up to ~150 bytes from start_ea on the main thread and cache the raw bytes
+  // threads only see pre_insn_t — no IDA API needed after this point
+  static std::vector<pre_insn_t> pre_decode(ea_t start_ea, ea_t ea_max) {
+    std::vector<pre_insn_t> insns;
+    size_t total_bytes = 0;
+
+    func_item_iterator_t it;
+    it.set_range(start_ea, ea_max);
+
+    while (total_bytes < 150) {
+      ea_t addr = it.current();
+
+      insn_t insn;
+      if (!decode_insn(&insn, addr)) break;
+
+      if (n_settings::data & FLAG_RESPECT_FUNCTION_BOUNDARIES) {
+        func_t* f = get_func(addr);
+        if (f != nullptr && addr >= f->end_ea) break;
+      }
+
+      pre_insn_t pi;
+      pi.size       = insn.size;
+      pi.imm_offset = n_utils::get_insn_imm_offset(&insn);
+      pi.raw.resize(insn.size);
+      get_bytes(pi.raw.data(), insn.size, addr);
+      total_bytes += insn.size;
+
+      // IDA doesn't parse int3/nop correctly in iterators, step over manually
+      bool manual_step = (pi.raw[0] == 0xCC || pi.raw[0] == 0x90);
+      insns.push_back(std::move(pi));
+
+      if (manual_step)
+        it.set_range(addr + 1, ea_max);
+      else if (!it.next_not_tail())
+        break;
+    }
+
+    return insns;
+  }
+
+  struct xref_result_t { ea_t caller_ea; std::string sig; };
+
+  // worker: builds sig byte-by-byte from pre-decoded instructions and checks uniqueness
+  // against the memory snapshot — called from threads, zero IDA API usage
+  static bool xref_worker(const std::vector<pre_insn_t>& insns,
+                          const std::vector<mem_section_t>& mem,
+                          ea_t caller_ea, ea_t ea_min,
+                          e_signature_style style,
+                          xref_result_t& out) {
+    bool use_wildcards = !(n_settings::data & FLAG_DISABLE_WILDCARDS);
+    c_signature_generator sig_gen;
+    ea_t last_found = ea_min;
+
+    for (const auto& pi : insns) {
+      // wildcard the immediate operand bytes, keep the rest fixed
+      for (u32 k = 0; k < pi.size; k++) {
+        bool is_imm = use_wildcards && pi.imm_offset > 0 && (i32)k >= pi.imm_offset;
+        sig_gen.add(pi.raw[k], is_imm);
+      }
+
+      // skip until we have something worth searching — first instr is usually E8 ?? ?? ?? ??
+      if (sig_gen.bytes.size() < 8) continue;
+
+      ea_t found = mem_find(mem, sig_gen.bytes, sig_gen.imm, last_found, caller_ea);
+      if (found == BADADDR) {
+        // nothing else matches — unique sig found
+        sig_gen.trim();
+        i8* rendered = sig_gen.render(style);
+        if (rendered == nullptr) return false;
+        out = { caller_ea, std::string(rendered) };
+        free(rendered);
+        return true;
+      }
+
+      last_found = found;
+    }
+    return false;
+  }
+
+  // --- end parallel XREF helpers ---
+
   static void create_xref(e_signature_style style) {
     ea_t target_ea = get_screen_ea();
 
-    // Prefer function start for XREF lookup when inside a function
     func_t* func = get_func(target_ea);
-    if (func != nullptr)
-      target_ea = func->start_ea;
+    if (func != nullptr) target_ea = func->start_ea;
 
     replace_wait_box("[Fusion] Collecting XREFs to `0x%llX`...", target_ea);
 
-    // Collect all code XREFs (calls + jumps, skip ordinary flow)
+    // grab all call/jmp xrefs, ignore ordinary flow (fl_F)
     std::vector<ea_t> call_sites;
     xrefblk_t xref;
     for (bool ok = xref.first_to(target_ea, 0); ok; ok = xref.next_to()) {
@@ -275,12 +415,10 @@ namespace n_signature{
     }
 
     if (call_sites.empty()) {
-      // Count data XREFs as a hint (virtual dispatch / vtable functions have data refs only)
       u32 data_xref_count = 0;
       xrefblk_t dxref;
       for (bool ok = dxref.first_to(target_ea, XREF_DATA); ok; ok = dxref.next_to())
         data_xref_count++;
-
       hide_wait_box();
       if (data_xref_count > 0)
         warning("[Fusion] No code XREFs found to `0x%llX`.\n\nFound %u data XREF(s) - this function is likely called through a vtable (virtual dispatch).\n\nSign the vtable entry or a function that calls it directly instead.", target_ea, data_xref_count);
@@ -289,63 +427,73 @@ namespace n_signature{
       return;
     }
 
+    // drop call sites that aren't inside a real function (dead regions)
+    if (!(n_settings::data & FLAG_ALLOW_SIG_CREATION_IN_DR)) {
+      call_sites.erase(
+        std::remove_if(call_sites.begin(), call_sites.end(),
+          [](ea_t ea) { return get_func_num(ea) == 0xFFFFFFFF; }),
+        call_sites.end());
+    }
+
+    if (call_sites.empty()) {
+      hide_wait_box();
+      warning("[Fusion] All XREFs to `0x%llX` are in non-function regions.", target_ea);
+      return;
+    }
+
     ea_t ea_min = 0, ea_max = 0;
     n_utils::get_text_min_max(ea_min, ea_max);
 
     msg("[Fusion] %zu XREF(s) to 0x%llX, generating signatures...\n", call_sites.size(), target_ea);
 
-    struct xref_result_t { ea_t caller_ea; std::string sig; };
-    std::vector<xref_result_t> results;
-    auto overall_start = std::chrono::high_resolution_clock::now();
+    // snapshot all exec segments — held in RAM only for the duration of this call
+    replace_wait_box("[Fusion] Loading memory image...");
+    auto mem = load_memory_image();
+
+    // decode all call sites on the main thread (IDA API required here)
+    struct decoded_site_t { ea_t caller_ea; std::vector<pre_insn_t> insns; };
+    std::vector<decoded_site_t> sites;
+    sites.reserve(call_sites.size());
 
     for (size_t i = 0; i < call_sites.size(); i++) {
-      if (user_cancelled())
-        break;
-
-      ea_t caller_ea = call_sites[i];
-      replace_wait_box("[Fusion] XREF %zu/%zu (0x%llX)...", i + 1, call_sites.size(), caller_ea);
-
-      if (!(n_settings::data & FLAG_ALLOW_SIG_CREATION_IN_DR) && get_func_num(caller_ea) == 0xFFFFFFFF)
-        continue;
-
-      c_signature_generator sig_gen;
-      ea_t last_found = ea_min;
-      func_item_iterator_t iterator;
-      iterator.set_range(caller_ea, ea_max);
-
-      for (ea_t addr = iterator.current(); true; addr = iterator.current()) {
-        i32 result = process_instruction(addr, sig_gen, iterator, ea_max);
-        if (result == 0)
-          break;
-
-        // Skip search until we have enough bytes (first call instr is always E8 ?? ?? ?? ??)
-        // and bail out if the sig grows too large without becoming unique (random optimization)
-        size_t byte_count = sig_gen.bytes.size();
-        if (byte_count < 8) { if (result == 2) continue; continue; }
-        if (byte_count > 100) break;
-
-        i8* ida_sig = sig_gen.render(SIGNATURE_STYLE_IDA);
-        if (ida_sig == nullptr)
-          break;
-
-        std::vector<ea_t> search_result = find(ida_sig, {true, true, caller_ea, last_found, false});
-        free(ida_sig);
-
-        if (search_result.empty()) {
-          sig_gen.trim();
-          i8* signature = sig_gen.render(style);
-          if (signature != nullptr) {
-            results.push_back({caller_ea, std::string(signature)});
-            free(signature);
-          }
-          break;
-        }
-
-        last_found = search_result[0];
-        if (result == 2)
-          continue;
-      }
+      if (user_cancelled()) { hide_wait_box(); return; }
+      replace_wait_box("[Fusion] Pre-decoding XREF %zu/%zu...", i + 1, call_sites.size());
+      sites.push_back({ call_sites[i], pre_decode(call_sites[i], ea_max) });
     }
+
+    // hand off to worker threads — each thread gets a slice of call sites and
+    // searches the memory snapshot independently (no IDA API, no shared writes)
+    replace_wait_box("[Fusion] Searching (%zu thread(s))...",
+      std::max(1u, std::thread::hardware_concurrency()));
+
+    auto overall_start = std::chrono::high_resolution_clock::now();
+
+    std::vector<xref_result_t> results;
+    std::mutex results_mutex;
+
+    unsigned int hw = std::max(1u, std::thread::hardware_concurrency());
+    size_t n     = sites.size();
+    size_t grain = (n + hw - 1) / hw;
+
+    std::vector<std::thread> threads;
+    threads.reserve(hw);
+
+    for (size_t t = 0; t < hw; t++) {
+      size_t start = t * grain;
+      if (start >= n) break;
+      size_t end = std::min(start + grain, n);
+      threads.emplace_back([&, start, end]() {
+        for (size_t i = start; i < end; i++) {
+          xref_result_t res;
+          if (xref_worker(sites[i].insns, mem, sites[i].caller_ea, ea_min, style, res)) {
+            std::lock_guard<std::mutex> lock(results_mutex);
+            results.push_back(std::move(res));
+          }
+        }
+      });
+    }
+
+    for (auto& t : threads) t.join();
 
     if (results.empty()) {
       hide_wait_box();
@@ -353,8 +501,7 @@ namespace n_signature{
       return;
     }
 
-    // Sort by sig length (shortest first, like ida-sigmaker)
-    std::sort(results.begin(), results.end(), [](const xref_result_t& a, const xref_result_t& b){
+    std::sort(results.begin(), results.end(), [](const xref_result_t& a, const xref_result_t& b) {
       return a.sig.size() < b.sig.size();
     });
 
@@ -366,7 +513,6 @@ namespace n_signature{
 
     msg("[Fusion] Done: %zu XREF sig(s), shortest first (%.3fs) - shortest copied to clipboard\n", results.size(), elapsed);
 
-    // Copy shortest (first after sort) to clipboard
     if (n_settings::data & FLAG_COPY_CREATED_SIGNATURES_TO_CB)
       n_utils::copy_to_clipboard((i8*)results[0].sig.c_str());
 
