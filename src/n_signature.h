@@ -31,7 +31,7 @@ namespace n_signature{
       if(!signature.empty() && signature[0] == ' ')
         signature.erase(0, 1);
     }
-    
+
     if(!find_settings.silent){
       hide_wait_box();
       show_wait_box("[Fusion] Searching...");
@@ -250,5 +250,113 @@ namespace n_signature{
 
       beep(beep_default);
     }
+  }
+
+  static void create_xref(e_signature_style style) {
+    ea_t target_ea = get_screen_ea();
+
+    // Prefer function start for XREF lookup when inside a function
+    func_t* func = get_func(target_ea);
+    if (func != nullptr)
+      target_ea = func->start_ea;
+
+    replace_wait_box("[Fusion] Collecting XREFs to `0x%llX`...", target_ea);
+
+    // Collect all code XREFs (calls + jumps, skip ordinary flow)
+    std::vector<ea_t> call_sites;
+    xrefblk_t xref;
+    for (bool ok = xref.first_to(target_ea, 0); ok; ok = xref.next_to()) {
+      if (xref.iscode && xref.type != fl_F)
+        call_sites.push_back(xref.from);
+    }
+
+    if (call_sites.empty()) {
+      // Count data XREFs as a hint (virtual dispatch / vtable functions have data refs only)
+      u32 data_xref_count = 0;
+      xrefblk_t dxref;
+      for (bool ok = dxref.first_to(target_ea, XREF_DATA); ok; ok = dxref.next_to())
+        data_xref_count++;
+
+      hide_wait_box();
+      if (data_xref_count > 0)
+        warning("[Fusion] No code XREFs found to `0x%llX`.\n\nFound %u data XREF(s) - this function is likely called through a vtable (virtual dispatch).\n\nSign the vtable entry or a function that calls it directly instead.", target_ea, data_xref_count);
+      else
+        warning("[Fusion] No XREFs found to `0x%llX`.", target_ea);
+      return;
+    }
+
+    ea_t ea_min = 0, ea_max = 0;
+    n_utils::get_text_min_max(ea_min, ea_max);
+
+    msg("[Fusion] %zu XREF(s) to 0x%llX, generating signatures...\n", call_sites.size(), target_ea);
+
+    struct xref_result_t { ea_t caller_ea; std::string sig; };
+    std::vector<xref_result_t> results;
+    auto overall_start = std::chrono::high_resolution_clock::now();
+
+    for (size_t i = 0; i < call_sites.size(); i++) {
+      ea_t caller_ea = call_sites[i];
+      replace_wait_box("[Fusion] XREF %zu/%zu (0x%llX)...", i + 1, call_sites.size(), caller_ea);
+
+      if (!(n_settings::data & FLAG_ALLOW_SIG_CREATION_IN_DR) && get_func_num(caller_ea) == 0xFFFFFFFF)
+        continue;
+
+      c_signature_generator sig_gen;
+      ea_t last_found = ea_min;
+      func_item_iterator_t iterator;
+      iterator.set_range(caller_ea, ea_max);
+
+      for (ea_t addr = iterator.current(); true; addr = iterator.current()) {
+        i32 result = process_instruction(addr, sig_gen, iterator, ea_max);
+        if (result == 0)
+          break;
+
+        i8* ida_sig = sig_gen.render(SIGNATURE_STYLE_IDA);
+        if (ida_sig == nullptr)
+          break;
+
+        std::vector<ea_t> search_result = find(ida_sig, {true, true, caller_ea, last_found, false});
+        free(ida_sig);
+
+        if (search_result.empty()) {
+          sig_gen.trim();
+          i8* signature = sig_gen.render(style);
+          if (signature != nullptr) {
+            results.push_back({caller_ea, std::string(signature)});
+            free(signature);
+          }
+          break;
+        }
+
+        last_found = search_result[0];
+        if (result == 2)
+          continue;
+      }
+    }
+
+    if (results.empty()) {
+      hide_wait_box();
+      warning("[Fusion] No unique XREF signature could be generated for `0x%llX`.", target_ea);
+      return;
+    }
+
+    // Sort by sig length (shortest first, like ida-sigmaker)
+    std::sort(results.begin(), results.end(), [](const xref_result_t& a, const xref_result_t& b){
+      return a.sig.size() < b.sig.size();
+    });
+
+    double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::high_resolution_clock::now() - overall_start).count() / 1000.0;
+
+    for (size_t i = 0; i < results.size(); i++)
+      msg("[Fusion] XREF[%zu] 0x%08llX -> %s\n", i + 1, results[i].caller_ea, results[i].sig.c_str());
+
+    msg("[Fusion] Done: %zu XREF sig(s), shortest first (%.3fs) - shortest copied to clipboard\n", results.size(), elapsed);
+
+    // Copy shortest (first after sort) to clipboard
+    if (n_settings::data & FLAG_COPY_CREATED_SIGNATURES_TO_CB)
+      n_utils::copy_to_clipboard((i8*)results[0].sig.c_str());
+
+    beep(beep_default);
   }
 };

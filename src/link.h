@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 #include <chrono>
+#include <algorithm>
 #ifdef __NT__
 #include <windows.h>
 #endif
@@ -20,6 +21,7 @@
 #include <search.hpp>
 #include <kernwin.hpp>
 #include <diskio.hpp>
+#include <xref.hpp>
 
 // Custom
 #include "n_utils.h"
