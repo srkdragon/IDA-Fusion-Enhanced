@@ -1,5 +1,15 @@
 #include "link.h"
 
+enum e_plugin_action {
+  PLUGIN_ACTION_CREATE_CODE_SIGNATURE = 0,
+  PLUGIN_ACTION_CREATE_IDA_SIGNATURE = 1,
+  PLUGIN_ACTION_CREATE_CRC32_SIGNATURE = 2,
+  PLUGIN_ACTION_CREATE_FNV1A_SIGNATURE = 3,
+  PLUGIN_ACTION_CREATE_XREF_SIGNATURES = 4,
+  PLUGIN_ACTION_CONFIGURE_SETTINGS = 5,
+  PLUGIN_ACTION_SEARCH_SIGNATURE = 6,
+};
+
 // Global plugin dialog function
 EXTERN bool idaapi plugin_run(size_t arg){
     std::string form_str = n_utils::format(
@@ -9,7 +19,8 @@ EXTERN bool idaapi plugin_run(size_t arg){
       "<#Generate signature (CRC-32 Style):R>\n"
       "<#Generate signature (FNV1-A Style):R>\n"
       "<#Generate XREF signatures (IDA Style):R>\n"
-      "<#Configure settings:R>>\n"
+      "<#Configure settings:R>\n"
+      "<#Search for a signature (CODE/IDA):R>>\n"
       "\n"
       "<#Use wildcards for immediate values:C>\n"
       "<#Respect function boundaries:C>>\n", (float)IDA_SDK_VERSION / 100.f
@@ -19,6 +30,10 @@ EXTERN bool idaapi plugin_run(size_t arg){
     static i32  choice  = (n_settings::data >> CHOICE_SHIFT) & CHOICE_MASK;
     static u32  use_wildcards = 1; // Default: enabled
     static u32  respect_boundaries = 1; // Default: enabled
+
+    if(choice < PLUGIN_ACTION_CREATE_CODE_SIGNATURE || choice > PLUGIN_ACTION_SEARCH_SIGNATURE)
+      choice = PLUGIN_ACTION_CREATE_CODE_SIGNATURE;
+
     bool        form_ok = ask_form(form_str.c_str(), &choice, &use_wildcards, &respect_boundaries);
 
     if(!form_ok)
@@ -42,38 +57,53 @@ EXTERN bool idaapi plugin_run(size_t arg){
     n_settings::save_settings();
 
     switch(choice){
-      case 0:{
+      case PLUGIN_ACTION_CREATE_CODE_SIGNATURE:{
         show_wait_box("[Fusion] Creating CODE signature...");
         n_signature::create(SIGNATURE_STYLE_CODE);
         hide_wait_box();
         break;
       }
-      case 1:{
+      case PLUGIN_ACTION_CREATE_IDA_SIGNATURE:{
         show_wait_box("[Fusion] Creating IDA signature...");
         n_signature::create(SIGNATURE_STYLE_IDA);
         hide_wait_box();
         break;
       }
-      case 2:{
+      case PLUGIN_ACTION_CREATE_CRC32_SIGNATURE:{
         show_wait_box("[Fusion] Creating CRC-32 signature...");
         n_signature::create(SIGNATURE_STYLE_CRC32);
         hide_wait_box();
         break;
       }
-      case 3:{
+      case PLUGIN_ACTION_CREATE_FNV1A_SIGNATURE:{
         show_wait_box("[Fusion] Creating FNV-1A signature...");
         n_signature::create(SIGNATURE_STYLE_FNV1A);
         hide_wait_box();
         break;
       }
-      case 4:{
+      case PLUGIN_ACTION_CREATE_XREF_SIGNATURES:{
         show_wait_box("[Fusion] Finding XREFs...");
         n_signature::create_xref(SIGNATURE_STYLE_IDA);
         hide_wait_box();
         break;
       }
-      case 5:{
+      case PLUGIN_ACTION_CONFIGURE_SETTINGS:{
         n_settings::show_settings_dialog();
+        break;
+      }
+      case PLUGIN_ACTION_SEARCH_SIGNATURE:{
+        static i8 signature_to_find[8192] = {};
+        const std::string search_form = n_utils::format(
+          "Fusion - Enter CODE/IDA signature\n"
+          "<Signature:A5:%zu:100>",
+          sizeof(signature_to_find)
+        );
+        if(!ask_form(search_form.c_str(), signature_to_find))
+          break;
+
+        const bool stop_at_first = (n_settings::data & FLAG_STOP_AT_FIRST_SIGNATURE_FOUND) != 0;
+        const bool jump_to_found_addr = (n_settings::data & FLAG_AUTO_JUMP_TO_FOUND_SIGNATURES) != 0;
+        n_signature::find(signature_to_find, {false, stop_at_first, 0, 0, jump_to_found_addr});
         break;
       }
     }
