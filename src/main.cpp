@@ -125,15 +125,17 @@ ssize_t idaapi fusion_ui_listener_t::on_event(ssize_t notification_code, va_list
 plugmod_t* idaapi plugin_init(void){
   n_settings::load_settings();
 
+#ifdef __MAC__
+  constexpr const char* fusion_hotkey = "Cmd+Option+S";
+#else
+  constexpr const char* fusion_hotkey = "Ctrl+Alt+S";
+#endif
+
   action_desc_t desc_main = ACTION_DESC_LITERAL(
     "fusion:main",
     "Fusion",
     &ah_dialog,
-#ifdef __MAC__
-    "Cmd+Option+S",
-#else
-    "Ctrl+Alt+S",
-#endif
+    fusion_hotkey,
     "Open Fusion signature generator dialog",
     -1
   );
