@@ -30,3 +30,7 @@ Desktop.ini
 
 # Build directories
 release/
+
+# Test harness artifacts
+tests/*.exe
+tests/*.obj

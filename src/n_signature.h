@@ -1,7 +1,16 @@
 #pragma once
 
-// Include our signature generator
-#include "c_signature_generator.h"
+// Signature generation and search on top of the IDA SDK.
+// All pattern parsing / rendering / matching lives in the IDA-free sig_core,
+// so generate->search round-trips are provable outside IDA (see sig_core_selftest.h).
+
+#include "sig_core.h"
+
+using sig_core::e_signature_style;
+using sig_core::SIGNATURE_STYLE_CODE;
+using sig_core::SIGNATURE_STYLE_IDA;
+using sig_core::SIGNATURE_STYLE_FNV1A;
+using sig_core::SIGNATURE_STYLE_CRC32;
 
 struct s_signature_find_settings{
   bool silent             = true;   // Output information
@@ -12,25 +21,34 @@ struct s_signature_find_settings{
 };
 
 namespace n_signature{
-  static std::vector<ea_t> find(std::string signature, s_signature_find_settings find_settings){
+
+  // Render options mapped from the persisted settings flags.
+  static sig_core::render_opts_t make_render_opts(){
+    sig_core::render_opts_t o;
+    o.ida_dual_question = (n_settings::data & FLAG_USE_DUAL_QUESTION_MARKS) != 0;
+    o.code_unicode_wild = (n_settings::data & FLAG_USE_UNICODE_WILDCARD) != 0;
+    o.code_append_mask  = (n_settings::data & FLAG_INCLUDE_MASK_FOR_CODE_SIGS) != 0;
+    return o;
+  }
+
+  // Parse options for user-supplied signatures: both legacy CODE heuristics
+  // (maskless \x00 / \x2A mean wildcard) and IDA-style nibble wildcards stay enabled.
+  static sig_core::parse_opts_t make_parse_opts(){
+    return sig_core::parse_opts_t{};
+  }
+
+  // Compile a pattern into the structure bin_search consumes
+  // (same layout the SDK's raw image+mask overload builds internally).
+  static void compile_pattern(const sig_core::pattern_t& pat, compiled_binpat_vec_t* out){
+    compiled_binpat_t& bv = out->push_back();
+    bv.bytes.append(pat.bytes.data(), (int)pat.bytes.size());
+    bv.mask.append(pat.mask.data(), (int)pat.mask.size());
+  }
+
+  // Core search over a compiled pattern. BADADDR is the only not-found sentinel;
+  // address 0 is a legitimate match.
+  static std::vector<ea_t> find_pattern(const sig_core::pattern_t& pat, s_signature_find_settings find_settings){
     std::vector<ea_t> ea;
-
-    // Handle the conversion of a code style sig to an IDA one if required
-    if(strstr(signature.c_str(), "\\x")){
-      // Firstly, convert \x to a space
-      signature = std::regex_replace(signature, std::regex("\\\\x"), " ");
-
-      // Remove any masks before converting 00's to a ?
-      signature = std::regex_replace(signature, std::regex("x"), "");
-      signature = std::regex_replace(signature, std::regex("\\?"), "");
-
-      // Convert any 00's to ?
-      signature = std::regex_replace(signature, std::regex("00"), "?");
-
-      // Remove first space if there is one
-      if(!signature.empty() && signature[0] == ' ')
-        signature.erase(0, 1);
-    }
 
     if(!find_settings.silent){
       hide_wait_box();
@@ -41,22 +59,19 @@ namespace n_signature{
     ea_t ea_max = 0;
     n_utils::get_text_min_max(ea_min, ea_max);
 
+    compiled_binpat_vec_t sig_data;
+    compile_pattern(pat, &sig_data);
+
     ea_t addr = (find_settings.start_at_addr > 0 ? find_settings.start_at_addr : ea_min) - 1;
 
-#if IDA_SDK_VERSION >= 900
-    compiled_binpat_vec_t sig_data{};
-    parse_binpat_str(&sig_data, addr, signature.c_str(), 16);
-#endif
-
     while(true){
-#if IDA_SDK_VERSION >= 900
-      // IDA 9.x uses bin_search (bin_search3 was renamed)
-      addr = bin_search(addr + 1, ea_max, sig_data, BIN_SEARCH_NOCASE | BIN_SEARCH_FORWARD);
-#else
-      addr = find_binary(addr + 1, ea_max, signature.c_str(), 16, SEARCH_DOWN);
-#endif
+      // BIN_SEARCH_CASE: raw bytes must match exactly (0x61 must not match 0x41).
+      // BIN_SEARCH_BITMASK: mask[i] is a per-byte AND mask (0xFF literal, 0x00 wildcard,
+      // 0xF0/0x0F nibble) — identical semantics to sig_core::match_at.
+      addr = bin_search(addr + 1, ea_max, sig_data,
+                        BIN_SEARCH_FORWARD | BIN_SEARCH_CASE | BIN_SEARCH_BITMASK);
 
-      if(addr == 0 || addr == BADADDR)
+      if(addr == BADADDR)
         break;
 
       if(addr == find_settings.ignore_addr)
@@ -91,15 +106,39 @@ namespace n_signature{
     return ea;
   }
 
-  // Helper function to process instruction and add to signature
-  // Returns: 0 = break, 1 = continue with next_not_tail, 2 = continue without next_not_tail
-  static i32 process_instruction(ea_t addr, c_signature_generator& signature_generator, func_item_iterator_t& iterator, ea_t ea_max, insn_t* out_insn = nullptr){
+  // Search a user-supplied signature string (IDA or CODE style). Parse failures
+  // are reported instead of silently returning "no addresses found".
+  static std::vector<ea_t> find(std::string signature, s_signature_find_settings find_settings){
+    sig_core::parse_result_t parsed = sig_core::parse(signature, make_parse_opts());
+
+    if(!parsed.ok){
+      hide_wait_box();
+      msg("[Fusion] Signature parse error at position %zu: %s\n",
+          parsed.err_pos, parsed.err.c_str());
+      warning("[Fusion] Invalid signature:\n\n%s\n\n(input position %zu)",
+              parsed.err.c_str(), parsed.err_pos);
+      beep(beep_default);
+      return {};
+    }
+
+    return find_pattern(parsed.pat, find_settings);
+  }
+
+  // Process one instruction into the signature builder.
+  // Returns: 0 = stop generation, 1 = continue via next_not_tail, 2 = iterator already advanced (CC/90 step).
+  static i32 process_instruction(ea_t addr, sig_core::builder_t& signature_generator,
+                                 func_item_iterator_t& iterator, ea_t range_end,
+                                 bool respect_boundaries, insn_t* out_insn = nullptr){
+    // Never step past the effective range end (the user's selection in range mode).
+    if(addr >= range_end)
+      return 0;
+
     insn_t insn;
     if(!decode_insn(&insn, addr))
       return 0;
 
     // Check if we've reached a function boundary (if enabled)
-    if(n_settings::data & FLAG_RESPECT_FUNCTION_BOUNDARIES){
+    if(respect_boundaries){
       func_t* func = get_func(addr);
       if(func != nullptr && addr >= func->end_ea)
         return 0; // Don't go past function end
@@ -111,57 +150,70 @@ namespace n_signature{
     // Check if wildcards are enabled
     bool use_wildcards = !(n_settings::data & FLAG_DISABLE_WILDCARDS);
 
-    // Now add the bytes to the signature generator
-    for(ea_t op_addr = addr; op_addr < (addr + insn.size); op_addr++)
-      signature_generator.add(get_byte(op_addr), use_wildcards && imm_offset > 0 && (op_addr - addr) >= imm_offset);
+    // A selection ending mid-instruction contributes only the in-range bytes.
+    ea_t op_end = addr + insn.size;
+    if(op_end > range_end)
+      op_end = range_end;
 
-    // Return instruction if requested
+    for(ea_t op_addr = addr; op_addr < op_end; op_addr++)
+      signature_generator.add(get_byte(op_addr),
+                               use_wildcards && imm_offset > 0 && (op_addr - addr) >= imm_offset);
+
     if(out_insn != nullptr)
       *out_insn = insn;
 
     // These instructions are not parsed correctly by ida, so lets fix it
     if(get_byte(addr) == 0xCC || get_byte(addr) == 0x90){
-      iterator.set_range(addr + 1, ea_max);
+      iterator.set_range(addr + 1, range_end);
       return 2; // Continue but skip next_not_tail
     }
 
     return iterator.next_not_tail() ? 1 : 0;
   }
 
-  static void create(e_signature_style style){
-    if(!(n_settings::data & FLAG_ALLOW_SIG_CREATION_IN_DR) && get_func_num(get_screen_ea()) == 0xFFFFFFFF){
+  // Create a signature for target_ea (defaults to the cursor). Returns the
+  // rendered signature, empty on failure — the selftest closes the create->find
+  // loop through this return value.
+  static std::string create(e_signature_style style, ea_t target_ea = BADADDR, bool verbose = true){
+    bool explicit_ea = (target_ea != BADADDR);
+    if(!explicit_ea)
+      target_ea = get_screen_ea();
+
+    if(!(n_settings::data & FLAG_ALLOW_SIG_CREATION_IN_DR) && get_func_num(target_ea) == 0xFFFFFFFF){
       hide_wait_box();
-      warning("[Fusion] `0x%llX` Is not in a valid assembly region.\n\nHint: You can disable this in the settings of Fusion.", get_screen_ea());
-      return;
+      if(verbose)
+        warning("[Fusion] `0x%llX` Is not in a valid assembly region.\n\nHint: You can disable this in the settings of Fusion.", target_ea);
+      return "";
     }
 
     // Start timing
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    c_signature_generator signature_generator;
-    ea_t                  ea_region_start = 0;
-    ea_t                  ea_region_end   = 0;
-    ea_t                  ea_min          = 0;
-    ea_t                  ea_max          = 0;
+    sig_core::builder_t signature_generator;
+    ea_t                ea_region_start = 0;
+    ea_t                ea_region_end   = 0;
+    ea_t                ea_min          = 0;
+    ea_t                ea_max          = 0;
     n_utils::get_text_min_max(ea_min, ea_max);
 
-    // Display a status that we are creating a signature for our screen ea
-    replace_wait_box("[Fusion] Creating signature for `0x%llX`", get_screen_ea());
+    if(verbose)
+      replace_wait_box("[Fusion] Creating signature for `0x%llX`", target_ea);
 
     // If we have selected a range of assembly code, sig exactly those bytes (no trim — user chose them)
-    bool selected_range = (n_settings::data & FLAG_COPY_SELECTED_BYTES_ONLY_IN_RANGE)
+    bool selected_range = !explicit_ea
+                          && (n_settings::data & FLAG_COPY_SELECTED_BYTES_ONLY_IN_RANGE)
                           && read_range_selection(nullptr, &ea_region_start, &ea_region_end)
                           && ea_region_end > ea_region_start;
     if(selected_range){
       func_item_iterator_t iterator;
       iterator.set_range(ea_region_start, ea_region_end);
       for(ea_t addr = iterator.current(); true; addr = iterator.current()){
-        if(process_instruction(addr, signature_generator, iterator, ea_max) == 0)
+        // No boundary truncation in range mode: the user explicitly chose these bytes.
+        if(process_instruction(addr, signature_generator, iterator, ea_region_end, false) == 0)
           break;
       }
     }
     else{
-      ea_t target_addr        = get_screen_ea();
       ea_t last_found_address = ea_min;
 
       // Generate memory for the mnemonic opcodes list
@@ -172,29 +224,25 @@ namespace n_signature{
         memset(mnemonic_opcodes, 0, mnemonic_opcodes_len);
 
       func_item_iterator_t iterator;
-      iterator.set_range(target_addr, ea_max);
+      iterator.set_range(target_ea, ea_max);
       for(ea_t addr = iterator.current(); true; addr = iterator.current()){
         insn_t insn;
-        i32 result = process_instruction(addr, signature_generator, iterator, ea_max, &insn);
+        i32 result = process_instruction(addr, signature_generator, iterator, ea_max,
+                                         (n_settings::data & FLAG_RESPECT_FUNCTION_BOUNDARIES) != 0,
+                                         &insn);
         if(result == 0)
           break;
 
         // Add details on whats going on in relation to this creation
-        if(n_settings::data & FLAG_SHOW_MNEMONIC_OPCODES_SIGGED){
+        if(mnemonic_opcodes != nullptr){
           qsnprintf(mnemonic_opcodes + strlen(mnemonic_opcodes), mnemonic_opcodes_len - strlen(mnemonic_opcodes), "+ %s\n", insn.get_canon_mnem(PH));
-          replace_wait_box("[Fusion] Creating signature for `0x%llX`\n\n%s", target_addr, mnemonic_opcodes);
+          if(verbose)
+            replace_wait_box("[Fusion] Creating signature for `0x%llX`\n\n%s", target_ea, mnemonic_opcodes);
         }
 
-        // Attempt to search for this signature, if nothing is found then we have a unique signature
+        // Attempt to search for this signature, if nothing else is found then it is unique
         {
-          i8* ida_sig = signature_generator.render(SIGNATURE_STYLE_IDA);
-          if(ida_sig == nullptr){
-            error("[Fusion] fatal error rendering signature (1)\n");
-            break;
-          }
-
-          std::vector<ea_t> search_result = find(ida_sig, {true, true, target_addr, last_found_address, false});
-          free(ida_sig);
+          std::vector<ea_t> search_result = find_pattern(signature_generator.pat, {true, true, target_ea, last_found_address, false});
           if(search_result.empty())
             break;
 
@@ -212,108 +260,87 @@ namespace n_signature{
     }
 
     // Do we have a signature to build?
-    if(signature_generator.has_bytes){
-      // Don't trim selected-range sigs — user explicitly chose those bytes
-      if(!selected_range)
-        signature_generator.trim();
+    if(!signature_generator.has_bytes)
+      return "";
 
-      // Create a render of the signature in the selected style
-      i8* signature = signature_generator.render(style);
+    // Don't trim selected-range sigs — user explicitly chose those bytes
+    if(!selected_range)
+      signature_generator.trim();
 
-      if(signature == nullptr){
-        error("[Fusion] fatal error rendering signature (2)\n");
-        return;
-      }
+    if(!signature_generator.has_bytes)
+      return "";
 
-      // Calculate elapsed time
-      auto end_time = std::chrono::high_resolution_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-      double seconds = duration.count() / 1000.0;
+    // Create a render of the signature in the selected style
+    sig_core::render_result_t rendered = signature_generator.render(style, make_render_opts());
+    if(!rendered.ok){
+      hide_wait_box();
+      msg("[Fusion] Signature render error: %s\n", rendered.err.c_str());
+      return "";
+    }
 
-      // Auto-validate: Check signature uniqueness
-      std::vector<ea_t> validation_results = find(signature, {true, false, 0, 0, false});
-      size_t match_count = validation_results.size();
+    // Calculate elapsed time
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    double seconds = duration.count() / 1000.0;
 
-      // Create signature with timing info and match count for console display
+    // Auto-validate: search what the user actually gets (the rendered text,
+    // re-parsed — catches any clipboard-format ambiguity). Hash styles are not
+    // searchable text; validate the underlying pattern instead.
+    size_t match_count = 0;
+    if(style == SIGNATURE_STYLE_FNV1A || style == SIGNATURE_STYLE_CRC32){
+      match_count = find_pattern(signature_generator.pat, {true, false, 0, 0, false}).size();
+    }
+    else{
+      sig_core::parse_result_t roundtrip = sig_core::parse(rendered.out, make_parse_opts());
+      match_count = roundtrip.ok ? find_pattern(roundtrip.pat, {true, false, 0, 0, false}).size() : 0;
+    }
+
+    if(verbose){
       i8 buffer[8192 + 50];
       if(match_count == 1)
-        qsnprintf(buffer, sizeof(buffer), "%s (%.3fs | unique)", signature, seconds);
+        qsnprintf(buffer, sizeof(buffer), "%s (%.3fs | unique)", rendered.out.c_str(), seconds);
       else if(match_count == 0)
-        qsnprintf(buffer, sizeof(buffer), "%s (%.3fs | NO MATCHES)", signature, seconds);
+        qsnprintf(buffer, sizeof(buffer), "%s (%.3fs | NO MATCHES)", rendered.out.c_str(), seconds);
       else
-        qsnprintf(buffer, sizeof(buffer), "%s (%.3fs | %zu matches)", signature, seconds, match_count);
+        qsnprintf(buffer, sizeof(buffer), "%s (%.3fs | %zu matches)", rendered.out.c_str(), seconds, match_count);
 
-      // Copy ONLY signature to clipboard (without timing/matches), and always print to console
       if(n_settings::data & FLAG_COPY_CREATED_SIGNATURES_TO_CB)
-        n_utils::copy_to_clipboard(signature);
+        n_utils::copy_to_clipboard((i8*)rendered.out.c_str());
 
       msg("[Fusion] %s\n", buffer); // Always print full info to console
-
-      // Now free the rendered signature
-      free(signature);
-
       beep(beep_default);
     }
+
+    return rendered.out;
   }
 
-  struct mem_section_t {
-    ea_t           start_ea;
-    std::vector<u8> bytes;
-  };
-
-  // snapshot all executable segments into plain memory so threads can search without IDA API
-  static std::vector<mem_section_t> load_memory_image() {
-    std::vector<mem_section_t> sections;
+  // snapshot all segments into plain memory so threads can search without IDA API.
+  // Validity bitmap tracks initialized bytes — uninitialized regions never match.
+  static std::vector<sig_core::mem_section_t> load_memory_image() {
+    std::vector<sig_core::mem_section_t> sections;
     int count = get_segm_qty();
     for (int i = 0; i < count; i++) {
       segment_t* seg = getnseg(i);
-      if (seg == nullptr || !(seg->perm & SEGPERM_EXEC)) continue;
-      mem_section_t sec;
+      if (seg == nullptr) continue;
+      sig_core::mem_section_t sec;
       sec.start_ea = seg->start_ea;
       size_t len = (size_t)(seg->end_ea - seg->start_ea);
       sec.bytes.resize(len, 0);
-      get_bytes(sec.bytes.data(), len, seg->start_ea);
+      sec.valid.assign(len, false);
+      std::vector<u8> initmask((len + 7) / 8, 0);
+      ssize_t got = get_bytes(sec.bytes.data(), (ssize_t)len, seg->start_ea, GMB_READALL, initmask.data());
+      if (got > 0) {
+        for (size_t k = 0; k < (size_t)got && k < len; k++)
+          sec.valid[k] = (initmask[k / 8] & (1 << (k % 8))) != 0;
+      }
       sections.push_back(std::move(sec));
     }
     return sections;
   }
 
-  // brute-force scan the memory snapshot — safe to call from any thread
-  static ea_t mem_find(const std::vector<mem_section_t>& mem,
-                       const std::vector<u8>& sig_bytes,
-                       const std::vector<bool>& sig_imm,
-                       ea_t start_at, ea_t ignore_ea) {
-    size_t sig_len = sig_bytes.size();
-
-    for (const auto& sec : mem) {
-      size_t sec_len = sec.bytes.size();
-      if (sec_len < sig_len)            continue;
-      if (start_at >= sec.start_ea + sec_len) continue;
-
-      size_t     start_off = (start_at > sec.start_ea) ? (size_t)(start_at - sec.start_ea) : 0;
-      const u8*  data      = sec.bytes.data();
-
-      for (size_t i = start_off; i + sig_len <= sec_len; i++) {
-        if (sec.start_ea + i == ignore_ea) continue;
-
-        bool match = true;
-        for (size_t j = 0; j < sig_len; j++) {
-          if (!sig_imm[j] && data[i + j] != sig_bytes[j]) {
-            match = false;
-            break;
-          }
-        }
-
-        if (match) return sec.start_ea + i;
-      }
-    }
-
-    return BADADDR;
-  }
-
   struct pre_insn_t {
-    u32            size;
-    i32            imm_offset;
+    u32             size;
+    i32             imm_offset;
     std::vector<u8> raw;
   };
 
@@ -341,7 +368,8 @@ namespace n_signature{
       pi.size       = insn.size;
       pi.imm_offset = n_utils::get_insn_imm_offset(&insn);
       pi.raw.resize(insn.size);
-      get_bytes(pi.raw.data(), insn.size, addr);
+      // Short read => unreliable bytes; stop instead of signing garbage.
+      if (get_bytes(pi.raw.data(), (ssize_t)insn.size, addr) != (ssize_t)insn.size) break;
       total_bytes += insn.size;
 
       // IDA doesn't parse int3/nop correctly in iterators, step over manually
@@ -359,15 +387,16 @@ namespace n_signature{
 
   struct xref_result_t { ea_t caller_ea; std::string sig; };
 
-  // worker: builds sig byte-by-byte from pre-decoded instructions and checks uniqueness
-  // against the memory snapshot — called from threads, zero IDA API usage
+  // worker: builds the sig byte-by-byte from pre-decoded instructions and checks
+  // uniqueness against the memory snapshot — called from threads, zero IDA API usage.
   static bool xref_worker(const std::vector<pre_insn_t>& insns,
-                          const std::vector<mem_section_t>& mem,
+                          const std::vector<sig_core::mem_section_t>& mem,
                           ea_t caller_ea, ea_t ea_min,
                           e_signature_style style,
+                          sig_core::render_opts_t render_opts,
                           xref_result_t& out) {
     bool use_wildcards = !(n_settings::data & FLAG_DISABLE_WILDCARDS);
-    c_signature_generator sig_gen;
+    sig_core::builder_t sig_gen;
     ea_t last_found = ea_min;
 
     for (const auto& pi : insns) {
@@ -378,25 +407,24 @@ namespace n_signature{
       }
 
       // skip until we have something worth searching — first instr is usually E8 ?? ?? ?? ??
-      if (sig_gen.bytes.size() < 8) continue;
+      if (sig_gen.pat.bytes.size() < 8) continue;
 
-      ea_t found = mem_find(mem, sig_gen.bytes, sig_gen.imm, last_found, caller_ea);
-      if (found == BADADDR) {
+      auto found = sig_core::mem_find(mem, sig_gen.pat, last_found, (u64)caller_ea);
+      if (!found.has_value()) {
         // nothing else matches — unique sig found
         sig_gen.trim();
-        i8* rendered = sig_gen.render(style);
-        if (rendered == nullptr) return false;
-        out = { caller_ea, std::string(rendered) };
-        free(rendered);
+        if (!sig_gen.has_bytes)
+          return false;
+        sig_core::render_result_t rendered = sig_gen.render(style, render_opts);
+        if (!rendered.ok) return false;
+        out = { caller_ea, rendered.out };
         return true;
       }
 
-      last_found = found;
+      last_found = (ea_t)*found;
     }
     return false;
   }
-
-  // --- end parallel XREF helpers ---
 
   static void create_xref(e_signature_style style) {
     ea_t target_ea = get_screen_ea();
@@ -446,7 +474,7 @@ namespace n_signature{
 
     msg("[Fusion] %zu XREF(s) to 0x%llX, generating signatures...\n", call_sites.size(), target_ea);
 
-    // snapshot all exec segments — held in RAM only for the duration of this call
+    // snapshot all segments (search must judge uniqueness over the same span find() scans)
     replace_wait_box("[Fusion] Loading memory image...");
     auto mem = load_memory_image();
 
@@ -485,7 +513,8 @@ namespace n_signature{
       threads.emplace_back([&, start, end]() {
         for (size_t i = start; i < end; i++) {
           xref_result_t res;
-          if (xref_worker(sites[i].insns, mem, sites[i].caller_ea, ea_min, style, res)) {
+          if (xref_worker(sites[i].insns, mem, sites[i].caller_ea, ea_min, style,
+                          make_render_opts(), res)) {
             std::lock_guard<std::mutex> lock(results_mutex);
             results.push_back(std::move(res));
           }
@@ -501,21 +530,175 @@ namespace n_signature{
       return;
     }
 
-    std::sort(results.begin(), results.end(), [](const xref_result_t& a, const xref_result_t& b) {
+    // Re-validate every candidate with the real searcher on the main thread:
+    // the printed/copied sig must have exactly one match, at the caller.
+    size_t total = results.size();
+    std::vector<xref_result_t> verified;
+    for (size_t i = 0; i < results.size(); i++) {
+      replace_wait_box("[Fusion] Verifying %zu/%zu...", i + 1, results.size());
+      sig_core::parse_result_t parsed = sig_core::parse(results[i].sig, make_parse_opts());
+      if (!parsed.ok) continue;
+      std::vector<ea_t> matches = find_pattern(parsed.pat, {true, false, 0, 0, false});
+      if (matches.size() == 1 && matches[0] == results[i].caller_ea)
+        verified.push_back(std::move(results[i]));
+    }
+
+    if (verified.empty()) {
+      hide_wait_box();
+      warning("[Fusion] No XREF signature survived uniqueness verification for `0x%llX`.", target_ea);
+      return;
+    }
+
+    std::sort(verified.begin(), verified.end(), [](const xref_result_t& a, const xref_result_t& b) {
       return a.sig.size() < b.sig.size();
     });
 
     double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::high_resolution_clock::now() - overall_start).count() / 1000.0;
 
-    for (size_t i = 0; i < results.size(); i++)
-      msg("[Fusion] XREF[%zu] 0x%08llX -> %s\n", i + 1, results[i].caller_ea, results[i].sig.c_str());
+    for (size_t i = 0; i < verified.size(); i++)
+      msg("[Fusion] XREF[%zu] 0x%08llX -> %s (verified unique)\n", i + 1, verified[i].caller_ea, verified[i].sig.c_str());
 
-    msg("[Fusion] Done: %zu XREF sig(s), shortest first (%.3fs) - shortest copied to clipboard\n", results.size(), elapsed);
+    msg("[Fusion] Done: %zu/%zu XREF sig(s) verified, shortest first (%.3fs) - shortest copied to clipboard\n",
+        verified.size(), total, elapsed);
 
     if (n_settings::data & FLAG_COPY_CREATED_SIGNATURES_TO_CB)
-      n_utils::copy_to_clipboard((i8*)results[0].sig.c_str());
+      n_utils::copy_to_clipboard((i8*)verified[0].sig.c_str());
 
     beep(beep_default);
   }
-};
+
+  //------------------------------------------------------------------ IDA-coupled selftest
+  // V1/V2/V4/V5/V6: validates the IDA-layer invariants against the currently
+  // open database. Must run on the main thread inside IDA. Returns failure count.
+
+  static int run_ida_selftest(bool (*log_fn)(const char*)){
+    int fails = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = ""){
+      if(!ok){
+        fails++;
+        std::string line = std::string("[FAIL] ") + name + (detail.empty() ? "" : " | " + detail);
+        log_fn(line.c_str());
+      }
+    };
+
+    log_fn("[Fusion selftest] IDA-coupled checks (V1/V2/V4/V5/V6)");
+
+    ea_t ea_min = 0, ea_max = 0;
+    n_utils::get_text_min_max(ea_min, ea_max);
+
+    // Sample up to 32 non-trivial functions.
+    std::vector<ea_t> funcs;
+    int qty = get_func_qty();
+    for (int i = 0; i < qty && funcs.size() < 32; i++) {
+      func_t* f = getn_func(i);
+      if (f == nullptr || f->size() < 16)
+        continue;
+      funcs.push_back(f->start_ea);
+    }
+    check("V1 sampled functions exist", !funcs.empty());
+
+    // Helper: create a signature at fea in the given style, then verify the
+    // plugin's own searcher finds the generating address with it.
+    auto roundtrip = [&](e_signature_style st, ea_t fea) -> bool {
+      std::string sig = create(st, fea, false);
+      if (sig.empty())
+        return false;
+      sig_core::parse_result_t p = sig_core::parse(sig, make_parse_opts());
+      if (!p.ok)
+        return false;
+      std::vector<ea_t> res = find_pattern(p.pat, {true, false, 0, 0, false});
+      return std::find(res.begin(), res.end(), fea) != res.end();
+    };
+
+    // V1: create -> find round-trip, IDA style, on every sampled function.
+    for (ea_t fea : funcs)
+      check("V1 create->find round-trip (IDA)", roundtrip(SIGNATURE_STYLE_IDA, fea),
+            n_utils::format("ea=0x%llX", (u64)fea));
+
+    // V2: CODE style with unicode wildcards, maskless and masked (bug 2 end-to-end).
+    {
+      u32 saved = n_settings::data;
+      n_settings::data |= FLAG_USE_UNICODE_WILDCARD;
+      size_t testn = std::min<size_t>(funcs.size(), 4);
+      for (size_t i = 0; i < testn; i++)
+        check("V2 unicode CODE round-trip (maskless)",
+              roundtrip(SIGNATURE_STYLE_CODE, funcs[i]),
+              n_utils::format("ea=0x%llX", (u64)funcs[i]));
+      n_settings::data |= FLAG_INCLUDE_MASK_FOR_CODE_SIGS;
+      for (size_t i = 0; i < testn; i++)
+        check("V2 unicode CODE round-trip (masked)",
+              roundtrip(SIGNATURE_STYLE_CODE, funcs[i]),
+              n_utils::format("ea=0x%llX", (u64)funcs[i]));
+      n_settings::data = saved;
+    }
+
+    // V4: SDK assumption — bin_search honors BIN_SEARCH_BITMASK|BIN_SEARCH_CASE
+    // with nibble masks. Pattern is built FROM the bytes at `probe`, so a search
+    // starting at `probe` must return `probe` itself.
+    {
+      ea_t probe = funcs.empty() ? ea_min : funcs[0];
+      u8 buf[4];
+      bool ok = get_bytes(buf, 4, probe) == 4;
+      if (ok) {
+        sig_core::pattern_t p;
+        const u8 masks[4] = {0xFF, 0xF0, 0x0F, 0xFF};
+        for (int k = 0; k < 4; k++) {
+          p.bytes.push_back(buf[k]);
+          p.mask.push_back(masks[k]);
+        }
+        compiled_binpat_vec_t data;
+        compile_pattern(p, &data);
+        ea_t hit = bin_search(probe, ea_max, data,
+                              BIN_SEARCH_FORWARD | BIN_SEARCH_CASE | BIN_SEARCH_BITMASK);
+        ok = (hit == probe);
+      }
+      check("V4 bin_search BITMASK|CASE honored (nibble mask)", ok);
+    }
+
+    // V5: SDK assumption — get_bytes init-mask bit polarity matches is_loaded().
+    {
+      ea_t probe = funcs.empty() ? ea_min : funcs[0];
+      u8 buf[32];
+      u8 mask[(32 + 7) / 8];
+      ssize_t got = get_bytes(buf, 32, probe, GMB_READALL, mask);
+      bool ok = got > 0;
+      for (ssize_t k = 0; ok && k < got; k++) {
+        bool bit = (mask[k / 8] & (1 << (k % 8))) != 0;
+        if (bit != is_loaded(probe + k))
+          ok = false;
+      }
+      check("V5 get_bytes init-mask polarity == is_loaded", ok);
+    }
+
+    // V6: snapshot scanner results are a subset of find() results (bug 4 invariant).
+    {
+      std::vector<sig_core::mem_section_t> snap = load_memory_image();
+      size_t testn = std::min<size_t>(funcs.size(), 4);
+      for (size_t i = 0; i < testn; i++) {
+        ea_t fea = funcs[i];
+        std::string sig = create(SIGNATURE_STYLE_IDA, fea, false);
+        bool ok = !sig.empty();
+        if (ok) {
+          sig_core::parse_result_t p = sig_core::parse(sig, make_parse_opts());
+          ok = p.ok;
+          if (ok) {
+            std::vector<u64> snap_hits = sig_core::mem_find_all(snap, p.pat, 0, (u64)BADADDR);
+            std::vector<ea_t> find_hits = find_pattern(p.pat, {true, false, 0, 0, false});
+            for (u64 h : snap_hits) {
+              if (std::find(find_hits.begin(), find_hits.end(), (ea_t)h) == find_hits.end()) {
+                ok = false;
+                break;
+              }
+            }
+          }
+        }
+        check("V6 snapshot results subset of find results", ok,
+              n_utils::format("ea=0x%llX", (u64)fea));
+      }
+    }
+
+    return fails;
+  }
+
+}; // namespace n_signature

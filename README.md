@@ -46,6 +46,12 @@ lea rax, [rbx+10h]  →  lea rax, [rbx+?]
 
 This makes signatures resilient against anti-reversing techniques. Wildcard behavior is toggleable via dialog checkbox.
 
+### Signature formats & search semantics
+
+- **IDA style** (`48 8B ? 05`) — supports whole-byte (`?`/`??`) and nibble (`A?`/`?5`) wildcards. Tokens are strict two-hex-digit bytes; malformed signatures produce an explicit parse error.
+- **CODE style** (`\x48\x8B\x00\x05`) — when a trailing mask is present (` xx?x`) it governs wildcarding exactly. Maskless CODE signatures are inherently ambiguous text: `00` (and `2A`) bytes are read as wildcards, so a *literal* `00`/`2A` byte requires enabling *Include mask for code signatures*.
+- Search matches are exact (case-folded byte matching was removed) and address `0` is a valid match. XREF signatures are re-verified unique against the full database before being printed or copied.
+
 ![Signature Example](https://user-images.githubusercontent.com/89423559/170587870-133ff3c1-e95a-4a20-a9ca-deb1390cbd40.png)
 
 ---

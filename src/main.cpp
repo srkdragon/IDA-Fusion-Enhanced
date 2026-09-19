@@ -1,4 +1,5 @@
 #include "link.h"
+#include "sig_core_selftest.h"
 
 enum e_plugin_action {
   PLUGIN_ACTION_CREATE_CODE_SIGNATURE = 0,
@@ -26,10 +27,11 @@ EXTERN bool idaapi plugin_run(size_t arg){
       "<#Respect function boundaries:C>>\n", (float)IDA_SDK_VERSION / 100.f
     ).c_str();
 
-    // Load last choice from settings
-    static i32  choice  = (n_settings::data >> CHOICE_SHIFT) & CHOICE_MASK;
-    static u32  use_wildcards = 1; // Default: enabled
-    static u32  respect_boundaries = 1; // Default: enabled
+    // Load dialog state from the persisted settings on every invocation,
+    // so the checkboxes always reflect what was saved (never silently revert).
+    i32  choice             = (n_settings::data >> CHOICE_SHIFT) & CHOICE_MASK;
+    u32  use_wildcards      = (n_settings::data & FLAG_DISABLE_WILDCARDS) ? 0 : 1;
+    u32  respect_boundaries = (n_settings::data & FLAG_RESPECT_FUNCTION_BOUNDARIES) ? 1 : 0;
 
     if(choice < PLUGIN_ACTION_CREATE_CODE_SIGNATURE || choice > PLUGIN_ACTION_SEARCH_SIGNATURE)
       choice = PLUGIN_ACTION_CREATE_CODE_SIGNATURE;
@@ -150,6 +152,32 @@ ssize_t idaapi fusion_ui_listener_t::on_event(ssize_t notification_code, va_list
     }
   }
   return 0;
+}
+
+// Exported self-test. Run from IDAPython inside IDA with a database open:
+//   import ctypes; ctypes.CDLL(r"<idadir>\plugins\fusion64-windows-x64.dll").fusion_selftest()
+// Returns the number of failed checks (0 = PASS); details go to the Output window.
+static bool selftest_log(const char* line){
+  msg("%s\n", line);
+  return true;
+}
+
+EXTERN __declspec(dllexport) int fusion_selftest(){
+  u32 saved_settings = n_settings::data;
+  n_settings::data &= ~(FLAG_COPY_CREATED_SIGNATURES_TO_CB
+                        | FLAG_SHOW_MNEMONIC_OPCODES_SIGGED
+                        | FLAG_AUTO_JUMP_TO_FOUND_SIGNATURES);
+
+  show_wait_box("[Fusion] Running self-test...");
+
+  int failures = sig_selftest::run(selftest_log, 300)
+               + n_signature::run_ida_selftest(selftest_log);
+
+  hide_wait_box();
+  n_settings::data = saved_settings;
+
+  msg("[Fusion] SELFTEST %s - %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
+  return failures;
 }
 
 plugmod_t* idaapi plugin_init(void){
