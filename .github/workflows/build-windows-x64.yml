@@ -69,8 +69,12 @@ jobs:
           if exist release rmdir /s /q release
           mkdir obj
           mkdir release
-          cl /nologo /EHsc /O2 /std:c++17 /utf-8 /I sdk\src\include /D__NT__ /D__EA64__ /c src\*.cpp /Foobj\ || exit /b 1
-          link /NOLOGO /DLL /NOIMPLIB /OUT:%OUTPUT_PATH% obj\*.obj sdk\src\lib\x64_win_64\ida.lib user32.lib || exit /b 1
+          rem Full optimizations for maximum speed:
+          rem   /O2 max speed | /GL whole-program opt | /Gy function-level linking
+          rem   /arch:AVX2 vectorizes the signature scanner (requires an AVX2 CPU at runtime)
+          rem Link: /LTCG cross-module inlining | /OPT:REF drop unreferenced | /OPT:ICF fold identical code
+          cl /nologo /EHsc /O2 /GL /Gy /arch:AVX2 /std:c++17 /utf-8 /I sdk\src\include /D__NT__ /D__EA64__ /c src\*.cpp /Foobj\ || exit /b 1
+          link /NOLOGO /DLL /NOIMPLIB /LTCG /OPT:REF /OPT:ICF /OUT:%OUTPUT_PATH% obj\*.obj sdk\src\lib\x64_win_64\ida.lib user32.lib || exit /b 1
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
